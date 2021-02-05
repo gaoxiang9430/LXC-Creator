@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+#
+# Utility to manage virtual servers on Ubuntu 16.04
+#
+# Supported guests:
+# ubuntu xenial
+# ubuntu trusty
+# centos 6
+# centos 7
+#
+# Usage: devcloud list [ --plain ]
+#        devcloud add NAME [ --system SYSTEM --release RELEASE ]
+#        devcloud remove NAME
+#        devcloud clone SOURCE DESTINATION
+#
+# This script assumes that you
+# 0. install: apt install lxc lxc-templates
+# 1. uncommented "LXC_DHCP_CONFILE=/etc/lxc/dnsmasq.conf" in /etc/default/lxc-net
+# 2. sudo touch /etc/lxc/dnsmasq.conf
+# 3. install yum for centos containers: sudo apt-get install yum
+# 4. add this to /etc/network/interfaces to setup iptables-restore
+#    pre-up iptables-restore < /etc/iptables.rules
+#    post-down iptables-save > /etc/iptables.rules
+
+# 5. remember to run service lxc-net restart after running devcloud add
+# 6. check network port id
+
+import os
+import sys
+import argparse
+import shutil
+import re
+from tempfile import mkstemp
+from subprocess import call
+
+
+# Ports 4000-4100 and 5000-5020 are allowed in SoC for external access
+# We have one-to-one correspondence between ports and internal IPs for convenience
+
+init_ip = (10, 0, 3, 100)
+ports = list(range(4000, 4100)) + list(range(5000, 5020))
+
+port_by_ip = dict()
+
+for index, port in enumerate(ports):
+    ip = (init_ip[0], init_ip[1], init_ip[2], init_ip[3] + index)
+    port_by_ip[ip] = port
+
+
+def replace(file_path, pattern, subst):
+    fh, abs_path = mkstemp()
+    with open(abs_path,'w') as new_file:
+        with open(file_path) as old_file:
+            for line in old_file:
+                new_file.write(line.replace(pattern, subst))
+    os.close(fh)
+    os.remove(file_path)
+    shutil.move(abs_path, file_path)
+
+
+def replace_regexp(file_path, regexp, subst):
+    fh, abs_path = mkstemp()
+    with open(abs_path,'w') as new_file:
+        with open(file_path) as old_file:
+            for line in old_file:
+                new_file.write(re.sub(regexp, subst, line))
+    os.close(fh)
+    os.remove(file_path)
+    shutil.move(abs_path, file_path)
+
+
+def ip_to_str(ip):
+    return '{}.{}.{}.{}'.format(ip[0], ip[1], ip[2], ip[3])
+
+
+def str_to_ip(str):
+    return tuple(map(int, str.strip().split('.')))
+
+
+def read_dnsmasq():
+    with open('/etc/lxc/dnsmasq.conf') as file:
+        lines = file.readlines()
+    content = dict()
+    for line in lines:
+        _, value = line.split('=')
+        container, ipstr = value.split(',')
+        content[container] = str_to_ip(ipstr)
+    return content
+
+
+def write_dnsmasq(content):
+    shutil.copyfile('/etc/lxc/dnsmasq.conf', '/etc/lxc/dnsmasq.conf.backup')
+    with open('/etc/lxc/dnsmasq.conf', 'w') as file:
+        for container, ip in content.items():
+            file.write('dhcp-host={},{}\n'.format(container, ip_to_str(ip)))
+
+
+def get_available_ip():
+    taken = set(read_dnsmasq().values())
+    all = set(port_by_ip.keys())
+    available = all - taken
+    if len(available) == 0:
+        return None
+    sorted_by_last_byte = sorted(list(available), key=lambda ip: ip[3])
+    return sorted_by_last_byte.pop(0)
+
+
+IPTABLES = 'iptables -t nat {cmd} PREROUTING -p tcp -i eno1 --dport {port} -j DNAT --to-destination {ip}:{port}'
+
+IPTABLES_SAVE = 'iptables-save > /etc/iptables.rules'
+
+
+def add_iptables_rule(ip, port):
+    call(IPTABLES.format(cmd='-A', ip=ip_to_str(ip), port=port), shell=True)
+    call(IPTABLES_SAVE, shell=True)
+
+
+def delete_iptables_rule(ip, port):
+    call(IPTABLES.format(cmd='-D', ip=ip_to_str(ip), port=port), shell=True)
+    call(IPTABLES_SAVE, shell=True)
+
+
+def set_container_ssh_port(container, system, port):
+    sshd_config = '/var/lib/lxc/{}/rootfs/etc/ssh/sshd_config'.format(container)
+    shutil.copyfile(sshd_config, sshd_config + '.backup')
+    if system == 'ubuntu':
+        replace(sshd_config, "Port 22", "Port {}".format(port))
+        return
+    if system == 'centos':
+        replace(sshd_config, "#Port 22", "Port {}".format(port))
+        return
+    raise Exception("not implemented")
+
+
+def update_container_ssh_port(container, port):
+    sshd_config = '/var/lib/lxc/{}/rootfs/etc/ssh/sshd_config'.format(container)
+    shutil.copyfile(sshd_config, sshd_config + '.backup')
+    replace_regexp(sshd_config, re.compile('^Port \d+', re.MULTILINE), "Port {}".format(port))
+
+
+def set_container_autostart(container):
+    config = '/var/lib/lxc/{}/config'.format(container)
+    shutil.copyfile(config, config + '.backup')
+    with open(config, 'a') as file:
+        file.write('lxc.start.auto = 1\n')
+        file.write('lxc.start.delay = 5\n')
+
+
+def get_user_password(container, system):
+    if system == 'ubuntu':
+        return ('ubuntu', 'ubuntu')
+    if system == 'centos':
+        with open('/var/lib/lxc/{}/tmp_root_pass'.format(container)) as file:
+            password = file.read()
+        return ('root', password)
+    raise Exception("not implemented")
+
+
+def message_for_user(user, password, port):
+    return '''
+    The server has been created. To access it, use the following command:
+
+    ssh -p {port} {user}@HOST
+
+    The password is "{password}".
+    '''.format(user=user, password=password, port=port)
+
+
+def list_handler(args):
+    if args.plain:
+        call('lxc-ls', shell=True)
+    else:
+        call('lxc-ls --fancy', shell=True)
+
+
+def add_handler(args):
+    container = args.name
+    if args.system == None:
+        system = 'ubuntu'
+        release = 'xenial'
+    elif args.release is None:
+        print("Error: specify OS release", file=sys.stderr)
+        exit(1)
+    else:
+        system = args.system
+        release = args.release
+    dnsmasq = read_dnsmasq()
+    if container in dnsmasq.keys():
+        print("Error: container {} already exists".format(container), file=sys.stderr)
+        exit(1)
+    ip = get_available_ip()
+    port = port_by_ip[ip]
+    dnsmasq[container] = ip
+    write_dnsmasq(dnsmasq)
+    cmd = 'lxc-create -t {system} -n {name} -- --release {release}'
+    call(cmd.format(system=system, name=container, release=release), shell=True)
+    set_container_autostart(container)
+    set_container_ssh_port(container, system, port)
+    add_iptables_rule(ip, port)
+    user, password = get_user_password(container, system)
+    message = message_for_user(user, password, port)
+    print(message)
+
+
+def clone_handler(args):
+    source_container = args.source
+    new_container = args.destination
+    dnsmasq = read_dnsmasq()
+    if new_container in dnsmasq.keys():
+        print("Error: container {} already exists".format(new_container), file=sys.stderr)
+        exit(1)
+    ip = get_available_ip()
+    port = port_by_ip[ip]
+    dnsmasq[new_container] = ip
+    write_dnsmasq(dnsmasq)
+    call('lxc-stop -n {}'.format(source_container), shell=True)
+    call('lxc-clone -o {} -n {}'.format(source_container, new_container), shell=True)
+    call('lxc-start -n {} -d'.format(source_container), shell=True)
+    set_container_autostart(new_container)
+    update_container_ssh_port(new_container, port)
+    add_iptables_rule(ip, port)
+    message = message_for_user('UNKNOWN', 'UNKNOWN', port)
+    print(message)
+
+
+def remove_handler(args):
+    container = args.name
+    dnsmasq = read_dnsmasq()
+    ip = dnsmasq[container]
+    del dnsmasq[container]
+    write_dnsmasq(dnsmasq)
+    port = port_by_ip[ip]
+    delete_iptables_rule(ip, port)
+    call('lxc-stop -n {}'.format(container), shell=True)
+    call('lxc-destroy -n {}'.format(container), shell=True)
+
+
+if os.geteuid() != 0:
+    print("Error: you don't have permissions to execute this command", file=sys.stderr)
+    exit(1)
+    
+parser = argparse.ArgumentParser(prog='devcloud')
+subparsers = parser.add_subparsers(help='action to perform')
+
+list_parser = subparsers.add_parser('list', help='list current containers')
+list_parser.add_argument('--plain', action='store_true', help='print plain list')
+list_parser.set_defaults(func=list_handler)
+
+add_parser = subparsers.add_parser('add', help='add new container')
+add_parser.add_argument('name', help='container name')
+add_parser.add_argument('--system', choices=['ubuntu', 'centos'], help='container OS')
+add_parser.add_argument('--release', help='container OS release')
+add_parser.set_defaults(func=add_handler)
+
+clone_parser = subparsers.add_parser('clone', help='clone container')
+clone_parser.add_argument('source', help='existing container name')
+clone_parser.add_argument('destination', help='new container name')
+clone_parser.set_defaults(func=clone_handler)
+
+remove_parser = subparsers.add_parser('remove', help='remove container')
+remove_parser.add_argument('name', help='container name')
+remove_parser.set_defaults(func=remove_handler)
+
+args = parser.parse_args()
+args.func(args)
